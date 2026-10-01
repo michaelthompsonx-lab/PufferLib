@@ -1,6 +1,7 @@
 #pragma once
 #include <algorithm>
 #include <vector>
+#include "rewards.cuh"
 #include "../../src/puffysics/collision.cuh"
 #include "../../src/puffysics/contact_solver.cuh"
 
@@ -157,8 +158,10 @@ __device__ static bool racing_barrier_contact(const PfBody &before, const PfBody
 
 __global__ static void racing_barrier_solve(Env *envs, int count, RacingBarrierMesh mesh) {
     int i = blockIdx.x*blockDim.x+threadIdx.x;
-    if (i >= count || envs[i].task.done || envs[i].car.crashed) return;
+    if (i >= count) return;
     Env &e = envs[i];
+    e.wall_contact = false;
+    if (e.task.done || e.car.crashed) return;
     PfBody *bodies = mesh.bodies+i*2;
     bodies[0] = e.car.body;
     bodies[1] = {}; // Infinite-mass static map.
@@ -185,6 +188,7 @@ __global__ static void racing_barrier_solve(Env *envs, int count, RacingBarrierM
     PfManifold *contacts = mesh.contacts+i*RACING_BARRIER_CONTACTS;
     int used = 0;
     float wall_closing_speed = 0;
+    bool wall_patch[RACING_BARRIER_CONTACTS] = {};
     PfVec3 up = pf_quat_rotate(bodies[0].rotation,pf_v3(0,1,0));
     int limit = up.y > 0.25f ? mesh.wall_nodes : mesh.count;
     for (int node = 0; node < limit;) {
@@ -199,7 +203,9 @@ __global__ static void racing_barrier_solve(Env *envs, int count, RacingBarrierM
             PfVec3 normal;
             PfContactPoint point;
             if (!racing_barrier_contact(before,bodies[0],tri,mesh.materials[index/3],&normal,&point)) continue;
-            if (racing_wall_material(mesh.materials[index/3])) {
+            bool wall = racing_wall_material(mesh.materials[index/3]);
+            if (wall) {
+                e.wall_contact = true;
                 float closing = -pf_dot(pf_point_velocity(&bodies[0],point.point_a),normal);
                 wall_closing_speed = fmaxf(wall_closing_speed,closing);
             }
@@ -223,6 +229,7 @@ __global__ static void racing_barrier_solve(Env *envs, int count, RacingBarrierM
                     if (point.separation >= shallowest) continue;
                 } else target = used++;
                 contacts[target] = {};
+                wall_patch[target] = wall;
                 contacts[target].body_a = 0;
                 contacts[target].body_b = 1;
                 contacts[target].normal = normal;
@@ -230,6 +237,7 @@ __global__ static void racing_barrier_solve(Env *envs, int count, RacingBarrierM
                 contacts[target].restitution = 0.05f;
                 pf_manifold_tangents(&contacts[target]);
             }
+            wall_patch[target] = wall_patch[target] || wall;
             PfManifold &m = contacts[target];
             if (m.point_count < PF_MAX_MANIFOLD_POINTS) m.points[m.point_count++] = point;
             else {
@@ -241,10 +249,16 @@ __global__ static void racing_barrier_solve(Env *envs, int count, RacingBarrierM
         }
     }
     if (!used) return;
+    if (e.wall_contact) {
+        float cost = RACING_CONTACT_COST_PER_SECOND * RACING_DT;
+        e.race_reward -= cost;
+        e.wall_contact_penalty += cost;
+        e.wall_contact_seconds += RACING_DT;
+    }
     pf_solve_velocity_contacts(bodies,contacts,used);
     float impact = 0;
     for (int k = 0; k < used; k++)
-        impact = fmaxf(impact, contacts[k].normal_impulse);
+        if (wall_patch[k]) impact = fmaxf(impact, contacts[k].normal_impulse);
     float cost = racing_wall_impact_cost(impact, bodies[0].inverse_mass);
     if (cost > 0 && e.last_wall_impact_tick + RACING_IMPACT_COOLDOWN <= e.task.ticks) {
         e.race_reward -= cost;

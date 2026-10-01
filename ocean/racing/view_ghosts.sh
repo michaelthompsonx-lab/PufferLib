@@ -2,7 +2,7 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 # Latest eight snapshots from the completed ~1B-step run; names are shuffled at startup.
-exec ./racing_eval ghosts \
+exec ./puffer ghosts \
   "checkpoints/racing/1790518872539/0000000999817216.bin" \
   "checkpoints/racing/1790518872539/0000000998768640.bin" \
   "checkpoints/racing/1790518872539/0000000996147200.bin" \

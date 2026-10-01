@@ -16,7 +16,11 @@ struct Log {
 #ifdef RACING_MULTI
     float position, wins, contacts, wall_contacts, contact_overflow;
     float car_impacts, wall_impacts, wall_impact_penalty;
+    float wall_contact_penalty, wall_contact_seconds;
+    float car_contact_penalty, car_contact_seconds;
     float lap_seconds, record_beats, lap_bonus;
+    float offroad_seconds, wrongway_seconds, route_jumps, checkpoint_bonus, control_saturation;
+    float progress_reward, time_penalty, delay_penalty, mean_speed, mean_throttle, mean_brake;
 #endif
 };
 struct Env {
@@ -31,6 +35,12 @@ struct Env {
     PfVec3 race_before;
     PfQuat race_rotation;
     float race_reward, race_score, wall_impact_penalty, race_progress_limit;
+    float wall_contact_penalty, wall_contact_seconds;
+    float car_contact_penalty, car_contact_seconds;
+    bool wall_contact, car_contact;
+    float offroad_seconds, wrongway_seconds, active_seconds, checkpoint_bonus, saturated_seconds;
+    float progress_reward, time_penalty, delay_penalty, speed_integral, throttle_integral, brake_integral;
+    int route_jumps;
     double race_progress;
     int race_rank, race_contacts, barrier_contacts, barrier_overflow, overturned_ticks, stopped_ticks, race_settled;
     int last_car_impact_tick, last_wall_impact_tick, car_impacts, wall_impacts;
@@ -76,17 +86,36 @@ __global__ static void racing_batch_actions(Env *envs, int count, const float *a
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count)
         return;
-    for (int k = 0; k < 3; k++) {
-        float input[3] = {steering, throttle, brake};
-        float value = manual == i + 1 ? input[k] : actions[i * 3 + k];
-        envs[i].task.action[k] = isfinite(value) ? racing_clamp(value, k == 0 ? -1 : 0, 1) : 0;
+#ifdef RACING_MULTI
+    if (envs[i].task.done) return;
+#endif
+    float input[3] = {steering, throttle, brake};
+    if (manual != i + 1) {
+        for (int k = 0; k < 3; k++) {
+            float value = actions[i * 3 + k];
+            input[k] = isfinite(value) ? value : 0;
+        }
+#ifdef RACING_MULTI
+        float controls[3];
+        racing_policy_controls(input, controls);
+        for (int k = 0; k < 3; k++) input[k] = controls[k];
+#endif
     }
+    for (int k = 0; k < 3; k++)
+        envs[i].task.action[k] = isfinite(input[k])
+            ? racing_clamp(input[k], k == 0 ? -1 : 0, 1) : 0;
 }
 __global__ static void racing_batch_rays(
     Env *envs, int count, RacingCarConfig config, PfOptixRay *rays) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count)
         return;
+#ifdef RACING_MULTI
+    if (envs[i].task.done) {
+        for (int j = 0; j < 4; j++) rays[i * 4 + j] = {};
+        return;
+    }
+#endif
     PfOptixRay local[12];
     racing_car_rays_device(&envs[i].car, config, local);
     for (int j = 0; j < 4; j++)
@@ -102,6 +131,9 @@ __global__ static void racing_batch_physics(Env *envs, int count, RacingCarConfi
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count)
         return;
+#ifdef RACING_MULTI
+    if (envs[i].task.done) return;
+#endif
     PfOptixRay local_rays[12] = {};
     PfOptixHit local_hits[12] = {};
 #ifdef RACING_MULTI
@@ -174,6 +206,14 @@ __global__ static void racing_batch_sensor(Env *envs, RacingCarConfig config, Pf
 #endif
 ) {
     int i = blockIdx.x;
+#ifdef RACING_MULTI
+    if (envs[i].task.done) {
+        rays[i * 256 + threadIdx.x] = {};
+        if (threadIdx.x < RACING_GROUND_PROBES)
+            ground_rays[i * RACING_GROUND_PROBES + threadIdx.x] = {};
+        return;
+    }
+#endif
     racing_car_sensor_ray(&envs[i].car, config, rays + i * 256, threadIdx.x);
 #ifdef RACING_MULTI
     if (threadIdx.x < RACING_GROUND_PROBES)
@@ -190,6 +230,14 @@ __global__ static void racing_batch_observe(Env *envs, RacingCarConfig config,
 ) {
     int i = blockIdx.x, k = threadIdx.x;
     float *out = values + i * OBS_SIZE;
+#ifdef RACING_MULTI
+    if (envs[i].task.done) {
+        for (int j = k; j < OBS_SIZE; j += blockDim.x) {
+            out[j] = 0; observations[i * OBS_SIZE + j] = __float2bfloat16(0);
+        }
+        return;
+    }
+#endif
     racing_task_observe_device(&envs[i].task, &envs[i].car, config, route, route_count, length,
         hits + i * 256, gate_count, out, k);
 #ifdef RACING_MULTI
@@ -481,6 +529,14 @@ void puf_log(Log *log, Dict *out) {
     dict_set(out, "episode_return", log->episode_return);
     dict_set(out, "progress", log->progress);
     dict_set(out, "checkpoints", log->checkpoints);
+#ifdef RACING_MULTI
+    dict_set(out, "mean_speed_mps", log->mean_speed);
+    dict_set(out, "progress_reward", log->progress_reward);
+    dict_set(out, "mean_throttle", log->mean_throttle);
+    dict_set(out, "mean_brake", log->mean_brake);
+    dict_set(out, "time_penalty", log->time_penalty);
+    dict_set(out, "delay_penalty", log->delay_penalty);
+#endif
     dict_set(out, "laps", log->laps);
     dict_set(out, "crashes", log->crashes);
     dict_set(out, "offroad", log->offroad);
@@ -498,6 +554,15 @@ void puf_log(Log *log, Dict *out) {
     dict_set(out, "car_impacts", log->car_impacts);
     dict_set(out, "wall_impacts", log->wall_impacts);
     dict_set(out, "wall_impact_penalty", log->wall_impact_penalty);
+    dict_set(out, "wall_contact_penalty", log->wall_contact_penalty);
+    dict_set(out, "wall_contact_seconds", log->wall_contact_seconds);
+    dict_set(out, "car_contact_penalty", log->car_contact_penalty);
+    dict_set(out, "car_contact_seconds", log->car_contact_seconds);
+    dict_set(out, "offroad_seconds", log->offroad_seconds);
+    dict_set(out, "wrongway_seconds", log->wrongway_seconds);
+    dict_set(out, "route_jumps", log->route_jumps);
+    dict_set(out, "checkpoint_bonus", log->checkpoint_bonus);
+    dict_set(out, "control_saturation", log->control_saturation);
     dict_set(out, "lap_seconds", log->laps > 0 ? log->lap_seconds / log->laps : 0);
     dict_set(out, "record_beats", log->record_beats);
     dict_set(out, "lap_bonus", log->lap_bonus);

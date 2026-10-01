@@ -41,7 +41,7 @@ static void racing_hud_draw(const RacingCarFrame *frame, bool leader_follow,
         int panel=width<900 ? 240 : 290;
         DrawRectangle(12,52,panel,35+g.count*27,Fade((Color){12,16,23,255},0.85f));
         racing_hud_text("POS   DRIVER",24,63,13,LIGHTGRAY);
-        racing_hud_text("GAP / RESULT",12+panel-108,63,13,LIGHTGRAY);
+        racing_hud_text("GAP TO P1",12+panel-108,63,13,LIGHTGRAY);
         for (int row=0;row<g.count;++row) {
             int i=order[row], y=88+27*row;
             const RacingCarFrame &f=g.frames[i];
@@ -56,6 +56,7 @@ static void racing_hud_draw(const RacingCarFrame *frame, bool leader_follow,
             if (f.task_done==7) result=racing_lap_text(f.last_lap);
             else if (f.task_done || f.crashed) result=f.task_done==5 ? "DNF / STALL" : f.task_done==6 ? "TIMEOUT" : "DNF";
             else if (row==0) result="LEADER";
+            // Gaps use race-leader route distance, rather than distance to the preceding car.
             else result=TextFormat("+%.0f m",fmaxf(0,g.frames[order[0]].progress-f.progress));
             racing_hud_text(result,12+panel-108,y,13, f.task_done && f.task_done!=7 ? GRAY : RAYWHITE);
         }

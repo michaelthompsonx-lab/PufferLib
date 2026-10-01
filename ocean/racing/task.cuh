@@ -18,6 +18,7 @@ struct RacingRoutePoint {
 struct RacingTask {
     int cursor, ticks, done, offroad, offroad_wheels, route_jump;
     float route_delta, motion;
+    float time_limit;
     float s, distance, furthest, lateral, heading, stalled, wrongway;
     float action[3], pending, reward, total_reward, progress_credit;
 };
@@ -49,6 +50,11 @@ __device__ static float racing_route_s(
     const RacingRoutePoint *route, int count, float length, int i, float f) {
     float end = i + 1 == count ? length : route[i + 1].s;
     return route[i].s + f * (end - route[i].s);
+}
+// Reconcile standings with the current route projection, preserving the lap at wraparound.
+// Reward distance still rejects route jumps; standings must not retain those lost metres.
+__host__ __device__ static double racing_route_progress(double previous, float s, float length) {
+    return s + floor((previous - s) / length + 0.5) * length;
 }
 __device__ static bool racing_on_road(
     const RacingRoutePoint *route, int count, int cursor, PfVec3 wheel) {
@@ -90,6 +96,8 @@ __device__ static void racing_task_step(RacingTask *t, RacingCar *car, RacingCar
     if (t->done)
         return;
     t->ticks++;
+    int previous_cursor = t->cursor;
+    float previous_s = t->s;
     float f = 0;
     int i = racing_route_near(route, count, car->body.position, t->cursor, 6, &f);
     float s = racing_route_s(route, count, length, i, f);
@@ -118,9 +126,33 @@ __device__ static void racing_task_step(RacingTask *t, RacingCar *car, RacingCar
             t->offroad_wheels |= 1 << w;
         }
     }
-    // Reject cursor discontinuities as well as motion outside the road.
+    // Reject cursor discontinuities independently of the road/reward checks.
     float motion = pf_length(pf_sub(car->body.position, before));
     bool continuous = isfinite(delta) && fabsf(delta) <= motion * 2 + 0.1f;
+    // The nearest polyline projection can change abruptly at a corner while the
+    // car moves smoothly. Verify the previous projection against
+    // the physical before-pose, then measure motion in the new segment's frame.
+    // Only adjacent segment switches qualify; a stale s or a non-local shortcut
+    // still invalidates the traversal rather than manufacturing progress.
+    int cursor_step = (i - previous_cursor + count) % count;
+    // A wheel crossing the curb suppresses progress reward, but must not
+    // disable this geometric continuity proof and turn a projection correction
+    // into a fatal route jump.
+    if (!continuous && (cursor_step == 1 || cursor_step == count - 1)) {
+        int old_next = (previous_cursor + 1) % count, new_next = (i + 1) % count;
+        float old_before_s = racing_route_s(route, count, length, previous_cursor,
+            racing_project(before, route[previous_cursor].center, route[old_next].center));
+        float new_before_s = racing_route_s(route, count, length, i,
+            racing_project(before, route[i].center, route[new_next].center));
+        float previous_error = old_before_s - previous_s;
+        float physical_delta = s - new_before_s;
+        if (previous_error < -length * 0.5f) previous_error += length;
+        if (previous_error > length * 0.5f) previous_error -= length;
+        if (physical_delta < -length * 0.5f) physical_delta += length;
+        if (physical_delta > length * 0.5f) physical_delta -= length;
+        continuous = isfinite(previous_error) && isfinite(physical_delta)
+            && fabsf(previous_error) <= 0.1f && fabsf(physical_delta) <= motion * 2 + 0.1f;
+    }
     t->route_jump = !continuous;
     t->route_delta = delta;
     t->motion = motion;
@@ -208,7 +240,7 @@ __device__ static void racing_task_observe_device(const RacingTask *t, const Rac
     obs[562] = t->lateral / 30;
     obs[563] = t->heading;
     obs[564] = car->trial.next / (float)gate_count;
-    obs[565] = t->ticks / (240.0f * 300);
+    obs[565] = t->ticks / (240.0f * (t->time_limit > 0 ? t->time_limit : 300.0f));
     obs[566] = t->offroad;
     obs[567] = t->furthest / length;
     for (int i = 512; i < RACING_BASE_OBS_SIZE; i++)

@@ -15,8 +15,8 @@ if [ ! -f ocean/racing/render_materials.bin ] || [ ! -f ocean/racing/car_lod.bin
   python3 ocean/racing/prepare_render.py
 fi
 if (( ${#models[@]} <= 1 )); then
-  exec ./racing_multi eval "${models[0]:-latest}" \
+  exec ./puffer eval "${models[0]:-latest}" \
     --policy.hidden_size=256 --policy.num_layers=3 "${options[@]}"
 fi
-exec ./racing_multi race "${models[@]}" \
+exec ./puffer race "${models[@]}" \
   --policy.hidden_size=256 --policy.num_layers=3 "${options[@]}"

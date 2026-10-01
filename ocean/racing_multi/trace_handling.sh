@@ -8,5 +8,5 @@ frames=${3:-2400}
 models=()
 for ((i = 0; i < 8; i++)); do models+=("$checkpoint"); done
 export RACING_TRACE_PATH="$output"
-exec ./racing_multi race "${models[@]}" --headless "--frames=$frames" \
+exec ./puffer race "${models[@]}" --headless "--frames=$frames" \
     --policy.hidden_size=256 --policy.num_layers=3

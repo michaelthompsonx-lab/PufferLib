@@ -15,7 +15,7 @@ struct RacingRaceState {
 };
 struct RacingRaceBatch {
     int cars, races, max_ticks;
-    float length, initial_lap_record;
+    float length, initial_lap_record, reward_discount;
     unsigned promotion_generation, promotion_active;
     unsigned *promotion_races, *promotion_points;
     RacingRaceState *states;
@@ -35,8 +35,8 @@ __device__ static int racing_race_compare(const Env &a, const Env &b) {
         double delta = b.car.trial.started - a.car.trial.started;
         return delta > 1e-7 ? 1 : delta < -1e-7 ? -1 : 0;
     }
-    bool a_dnf = a.car.crashed || a.task.done == 5;
-    bool b_dnf = b.car.crashed || b.task.done == 5;
+    bool a_dnf = a.car.crashed || a.task.done == 5 || a.task.done == 3;
+    bool b_dnf = b.car.crashed || b.task.done == 5 || b.task.done == 3;
     if (a_dnf != b_dnf) return a_dnf ? -1 : 1;
     double delta = a.race_progress - b.race_progress;
     return delta > 1e-4f ? 1 : delta < -1e-4f ? -1 : 0;
@@ -72,12 +72,20 @@ __device__ static void racing_race_reset_one(Env *envs, RacingRaceBatch race, in
         e.race_rotation = e.car.body.rotation;
         e.race_reward = 0;
         e.wall_impact_penalty = 0;
+        e.wall_contact_penalty = e.wall_contact_seconds = 0;
+        e.wall_contact = e.car_contact = false;
+        e.car_contact_penalty = e.car_contact_seconds = 0;
+        e.offroad_seconds = e.wrongway_seconds = e.active_seconds = 0;
+        e.route_jumps = 0; e.checkpoint_bonus = e.saturated_seconds = 0;
+        e.progress_reward = e.time_penalty = e.delay_penalty = 0;
+        e.speed_integral = e.throttle_integral = e.brake_integral = 0;
         e.race_contacts = e.barrier_contacts = e.barrier_overflow = 0;
         e.overturned_ticks = e.stopped_ticks = e.race_settled = 0;
         e.car_impacts = e.wall_impacts = 0;
         e.last_car_impact_tick = e.last_wall_impact_tick = -RACING_IMPACT_COOLDOWN;
         e.race_progress = e.task.s - race.length;
         e.race_progress_limit = race.length - e.race_progress;
+        e.task.time_limit = race.max_ticks * RACING_DT;
     }
     for (int slot = 0; slot < race.cars; slot++) {
         Env &e = envs[slot * race.races + world];
@@ -192,6 +200,7 @@ __global__ static void racing_race_contacts(Env *envs, RacingRaceBatch race) {
     int slots[RACING_RACE_MAX], count = 0;
     for (int slot = 0; slot < race.cars; slot++) {
         Env &e = envs[slot * race.races + world];
+        e.car_contact = false;
         if (e.task.done || e.car.crashed) continue;
         slots[count] = slot;
         bodies[count++] = e.car.body;
@@ -213,6 +222,8 @@ __global__ static void racing_race_contacts(Env *envs, RacingRaceBatch race) {
             const PfManifold &m = contacts.manifolds[j];
             impact[m.body_a] = fmaxf(impact[m.body_a], m.normal_impulse);
             impact[m.body_b] = fmaxf(impact[m.body_b], m.normal_impulse);
+            envs[slots[m.body_a] * race.races + world].car_contact = true;
+            envs[slots[m.body_b] * race.races + world].car_contact = true;
         }
         pf_solve_positions(&contacts);
         for (int j = 0; j < contacts.manifold_count; j++) {
@@ -222,6 +233,13 @@ __global__ static void racing_race_contacts(Env *envs, RacingRaceBatch race) {
         }
         for (int j = 0; j < count; j++) {
             Env &e = envs[slots[j] * race.races + world];
+            if (e.car_contact) {
+                // Once per car per physics step, even if several opponents touch it.
+                float cost = RACING_CONTACT_COST_PER_SECOND * RACING_DT;
+                e.race_reward -= cost;
+                e.car_contact_penalty += cost;
+                e.car_contact_seconds += RACING_DT;
+            }
             float cost = racing_impact_cost(impact[j], bodies[j].inverse_mass);
             if (cost > 0 && e.last_car_impact_tick + RACING_IMPACT_COOLDOWN <= race.states[world].ticks) {
                 e.race_reward -= cost;
@@ -246,6 +264,7 @@ __global__ static void racing_race_tasks(Env *envs, RacingRaceBatch race, Racing
         Env &e = envs[slot * race.races + world];
         active[slot] = true;
         float previous_furthest = e.task.furthest;
+        int previous_checkpoints = e.car.trial.checkpoints;
         PfVec3 up = pf_quat_rotate(e.car.body.rotation,pf_v3(0,1,0));
         e.overturned_ticks = up.y < 0.25f ? e.overturned_ticks + 1 : 0;
         if (e.overturned_ticks >= 3 * 240) e.car.crashed = 1;
@@ -259,6 +278,15 @@ __global__ static void racing_race_tasks(Env *envs, RacingRaceBatch race, Racing
         racing_task_step(&e.task, &e.car, config, route, route_count, length, e.race_before);
         // Race rewards replace time-trial shaping/refunds, keeping geometry bookkeeping.
         e.task.pending = e.task.progress_credit = 0;
+        e.active_seconds += RACING_DT;
+        e.speed_integral += pf_length(e.car.body.linear_velocity) * RACING_DT;
+        e.throttle_integral += e.task.action[1] * RACING_DT;
+        e.brake_integral += e.task.action[2] * RACING_DT;
+        e.saturated_seconds += (fabsf(e.task.action[0]) >= 0.95f
+            || e.task.action[1] >= 0.95f || e.task.action[2] >= 0.95f) ? RACING_DT : 0;
+        e.offroad_seconds += e.task.offroad ? RACING_DT : 0;
+        e.wrongway_seconds += e.task.wrongway > 0 ? RACING_DT : 0;
+        e.route_jumps += e.task.route_jump != 0;
         if (!e.task.done) {
             PfVec3 v = e.car.body.linear_velocity;
             e.stopped_ticks = v.x*v.x + v.z*v.z < RACING_STALL_SPEED*RACING_STALL_SPEED
@@ -270,17 +298,29 @@ __global__ static void racing_race_tasks(Env *envs, RacingRaceBatch race, Racing
         } else {
             racing_trial_step(&e.car.trial, gates, gate_count, e.race_before, e.car.body.position,
                 e.task.s, e.task.route_delta, length, e.task.route_jump);
-            if (e.car.trial.laps > 0) e.task.done = 7;
+            if (e.car.trial.invalid == 2) e.task.done = 3;
+            else if (e.car.trial.laps > 0) e.task.done = 7;
+            bool clean = !e.task.offroad && !e.task.route_jump && !e.car.trial.invalid
+                && !e.wall_contact && !e.car_contact;
+            float bonus = racing_checkpoint_reward(e.car.trial.checkpoints - previous_checkpoints,
+                race.states[world].ticks * RACING_DT, race.max_ticks * RACING_DT, clean);
+            e.race_reward += bonus; e.checkpoint_bonus += bonus;
         }
-        if (!e.task.route_jump) e.race_progress += e.task.route_delta;
+        e.race_progress = racing_route_progress(e.race_progress, e.task.s, length);
         // Standing uses signed metres; shaping pays each new maximum only once.
-        deltas[slot] = racing_progress_reward(e.task, previous_furthest, e.race_progress_limit);
+        deltas[slot] = racing_progress_reward(e.task, previous_furthest, e.race_progress_limit,
+            e.wall_contact || e.car_contact || e.car.crashed);
+        e.progress_reward += deltas[slot];
+        e.time_penalty += 0.005f * RACING_DT;
         e.race_reward -= 0.005f * RACING_DT;
     }
     __syncthreads();
     Env &e = envs[slot * race.races + world];
     float score = racing_race_score(envs, race, world, slot, &e.race_rank);
-    if (active[slot]) e.race_reward += 0.25f * (score - e.race_score) + deltas[slot];
+    bool clean = !e.task.offroad && !e.task.route_jump && !e.car.trial.invalid
+        && !e.wall_contact && !e.car_contact && !e.car.crashed && e.task.done != 5;
+    if (active[slot]) e.race_reward += racing_position_change_reward(score - e.race_score, clean)
+        + deltas[slot];
     e.race_score = score;
 }
 __global__ static void racing_race_finish(Env *envs, RacingRaceBatch race,
@@ -308,8 +348,15 @@ __global__ static void racing_race_finish(Env *envs, RacingRaceBatch race,
         // Finish order is fixed at crossing; crashes, stalls and unfinished timeouts lose.
         // Waiting for other cars must neither create training samples nor delayed credit.
         float outcome = !e.car.trial.laps || e.car.crashed || e.task.done == 5
-            ? RACING_DNF_REWARD : RACING_POSITION_REWARD * e.race_score;
+            ? racing_failure_outcome(race.reward_discount) : RACING_POSITION_REWARD * e.race_score;
         float reward = e.race_settled ? 0 : e.race_reward + (learning_end ? outcome : 0);
+        if (!e.race_settled) {
+            // One charge per active action, including a terminal action. No
+            // further cost or terminal credit while a retired car waits.
+            float cost = racing_failure_delay_cost(race.reward_discount);
+            reward -= cost;
+            e.delay_penalty += cost;
+        }
         if (learning_end && e.car.trial.laps > 0) {
             auto &state = race.states[world];
             float lap = (float)e.car.trial.last;
@@ -329,7 +376,11 @@ __global__ static void racing_race_finish(Env *envs, RacingRaceBatch race,
         if (!done) continue;
         auto &end = e.last_end;
         end.serial++;
-        end.reason = e.car.crashed ? 1 : e.task.done == 5 ? 5 : e.car.trial.laps ? 7 : 6;
+        end.reason = e.car.crashed ? 1 : e.task.done == 3 ? 3 : e.task.done == 5 ? 5 : e.car.trial.laps ? 7 : 6;
+        end.invalid = e.car.trial.invalid; end.route_jump = e.task.route_jump;
+        end.offroad_wheels = e.task.offroad_wheels;
+        end.route_delta = e.task.route_delta; end.motion = e.task.motion;
+        end.throttle = e.task.action[1]; end.brake = e.task.action[2];
         end.seconds = race.states[world].ticks * RACING_DT;
         end.speed = pf_length(e.car.body.linear_velocity);
         end.progress = e.task.furthest;
@@ -340,6 +391,13 @@ __global__ static void racing_race_finish(Env *envs, RacingRaceBatch race,
         end.position[2] = e.car.body.position.z;
         e.log.episode_return += e.task.total_reward;
         e.log.progress += e.task.furthest;
+        e.log.progress_reward += racing_reward_for_ppo(e.progress_reward);
+        e.log.time_penalty += racing_reward_for_ppo(e.time_penalty);
+        e.log.delay_penalty += racing_reward_for_ppo(e.delay_penalty);
+        float inv_seconds = e.active_seconds > 0 ? 1 / e.active_seconds : 0;
+        e.log.mean_speed += e.speed_integral * inv_seconds;
+        e.log.mean_throttle += e.throttle_integral * inv_seconds;
+        e.log.mean_brake += e.brake_integral * inv_seconds;
         e.log.checkpoints += e.car.trial.checkpoints;
         e.log.laps += e.car.trial.laps;
         if (e.car.trial.laps > 0) {
@@ -351,6 +409,14 @@ __global__ static void racing_race_finish(Env *envs, RacingRaceBatch race,
                 (float)e.car.trial.started, race.max_ticks * RACING_DT));
         }
         e.log.crashes += e.car.crashed != 0;
+        e.log.offroad += e.offroad_seconds > 0;
+        e.log.invalid += e.car.trial.invalid == 2;
+        e.log.wrongway += e.wrongway_seconds > 0;
+        e.log.offroad_seconds += e.offroad_seconds;
+        e.log.wrongway_seconds += e.wrongway_seconds;
+        e.log.route_jumps += e.route_jumps;
+        e.log.control_saturation += e.active_seconds > 0 ? e.saturated_seconds / e.active_seconds : 0;
+        e.log.checkpoint_bonus += racing_reward_for_ppo(e.checkpoint_bonus);
         e.log.stalled += e.task.done == 5;
         e.log.timeout += !e.task.done;
         e.log.contacts += e.race_contacts;
@@ -358,6 +424,10 @@ __global__ static void racing_race_finish(Env *envs, RacingRaceBatch race,
         e.log.car_impacts += e.car_impacts;
         e.log.wall_impacts += e.wall_impacts;
         e.log.wall_impact_penalty += racing_reward_for_ppo(e.wall_impact_penalty);
+        e.log.wall_contact_penalty += racing_reward_for_ppo(e.wall_contact_penalty);
+        e.log.wall_contact_seconds += e.wall_contact_seconds;
+        e.log.car_contact_penalty += racing_reward_for_ppo(e.car_contact_penalty);
+        e.log.car_contact_seconds += e.car_contact_seconds;
         e.log.contact_overflow += e.barrier_overflow;
         e.log.position += e.race_rank;
         e.log.wins += e.car.trial.laps > 0 && e.race_rank == 1;
@@ -427,6 +497,9 @@ static void racing_race_create(Dict *kwargs) {
     float seconds = dict_get(kwargs, "race_seconds");
     assert(isfinite(seconds) && seconds >= 1 && seconds <= 3600);
     race.max_ticks = (int)(seconds * 240);
+    race.reward_discount = dict_find(kwargs, "reward_discount")
+        ? (float)dict_get(kwargs, "reward_discount") : 0.9999f;
+    assert(isfinite(race.reward_discount) && race.reward_discount >= 0 && race.reward_discount <= 1);
     race.initial_lap_record = dict_get(kwargs, "lap_record_seconds");
     assert(isfinite(race.initial_lap_record) && race.initial_lap_record > 0);
     race.length = task_route_length;

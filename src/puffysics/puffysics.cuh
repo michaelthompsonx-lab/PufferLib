@@ -12,3 +12,11 @@
 #include "world.cuh"
 #include "soft_solver.cuh"
 #include "native.cuh"
+
+#include "sat_manifold.cuh"
+#include "impulse_solver.cuh"
+#include "compound_contact.cuh"
+#include "swept_collision.cuh"
+#include "serial_dynamics.cuh"
+#include "explicit_dynamics.cuh"
+#include "box_clearance.cuh"

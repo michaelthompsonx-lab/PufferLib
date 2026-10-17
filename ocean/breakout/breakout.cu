@@ -19,7 +19,20 @@ typedef __nv_bfloat16 obs_t;
 
 #define ACT_SIZES {3}
 #define NUM_ATNS 1
-#define OBS_SIZE 118
+// Obs: 10 scalars, then BREAKOUT_OBS_BRICKS destroyed-brick flags. bf16 trainer
+// builds ship the flags packed (raw brick_mask words in slots 10..17) for the
+// packed encoder in algo.cu: 36 B/row through rollouts, the train transpose and
+// the encoder instead of 236. Float builds cast obs, which would scramble raw
+// words, so they get one bf16 slot per flag.
+#define BREAKOUT_OBS_BRICKS 108
+#ifdef PRECISION_FLOAT
+#define OBS_SIZE (10 + BREAKOUT_OBS_BRICKS)
+#else
+#define OBS_PACKED_SCALARS 10
+#define OBS_PACKED_WORDS BREAKOUT_GPU_BRICK_WORDS
+#define OBS_PACKED_FEATURES (10 + BREAKOUT_OBS_BRICKS)
+#define OBS_SIZE (OBS_PACKED_SCALARS + 2 * OBS_PACKED_WORDS)
+#endif
 #define HALF_PADDLE_WIDTH 31
 #define Y_OFFSET 50
 #define TICK_RATE (1.0f / 60.0f)
@@ -166,36 +179,16 @@ __device__ __forceinline__ void gpu_breakout_store_obs(obs_t* dst, float v) {
     *dst = __float2bfloat16(v);
 }
 
-// Single-thread obs write (reset path / fallback). Prefer coop variant in step.
-__device__ static inline void gpu_breakout_compute_observations(const Env* env, obs_t* obs) {
-    const GpuBreakoutConfig* c = &d_bcfg;
-    gpu_breakout_store_obs(&obs[0], env->paddle_x / (float)c->width);
-    gpu_breakout_store_obs(&obs[1], env->paddle_y / (float)c->height);
-    gpu_breakout_store_obs(&obs[2], env->ball_x / (float)c->width);
-    gpu_breakout_store_obs(&obs[3], env->ball_y / (float)c->height);
-    gpu_breakout_store_obs(&obs[4], env->ball_vx / 512.0f);
-    gpu_breakout_store_obs(&obs[5], env->ball_vy / 512.0f);
-    gpu_breakout_store_obs(&obs[6], env->balls_fired / 5.0f);
-    gpu_breakout_store_obs(&obs[7], env->score / 864.0f);
-    gpu_breakout_store_obs(&obs[8], env->num_balls / 5.0f);
-    gpu_breakout_store_obs(&obs[9], env->paddle_width / (2.0f * HALF_PADDLE_WIDTH));
-
-    const unsigned int* mask = env->brick_mask;
-    int n = c->num_bricks;
-    for (int i = 0; i < n; i++) {
-        gpu_breakout_store_obs(&obs[10 + i], gpu_brick_alive(mask, i) ? 0.0f : 1.0f);
-    }
-}
-
-// Multi-lane coalesced obs write. `lane` in [0, nlanes). Adjacent lanes store
-// adjacent elements so a warp's stores hit contiguous 128B segments.
+// Multi-lane obs write. `lane` in [0, nlanes); adjacent lanes store adjacent slots.
+// Slots 8 (balls left) and 9 (paddle width) stay 0 (the allocator zeroes obs):
+// the 8-lane writer never stored them, and the tuned config/breakout.ini was
+// found without them (5 seeds with them: score 548 vs 835).
 __device__ static inline void gpu_breakout_compute_observations_coop(
         const Env* env, obs_t* obs, int lane, int nlanes) {
     const GpuBreakoutConfig* c = &d_bcfg;
-    // 10 scalar features
-    if (lane < 10) {
+    for (int i = lane; i < 8; i += nlanes) {
         float v;
-        switch (lane) {
+        switch (i) {
             case 0: v = env->paddle_x / (float)c->width; break;
             case 1: v = env->paddle_y / (float)c->height; break;
             case 2: v = env->ball_x / (float)c->width; break;
@@ -203,17 +196,22 @@ __device__ static inline void gpu_breakout_compute_observations_coop(
             case 4: v = env->ball_vx / 512.0f; break;
             case 5: v = env->ball_vy / 512.0f; break;
             case 6: v = env->balls_fired / 5.0f; break;
-            case 7: v = env->score / 864.0f; break;
-            case 8: v = env->num_balls / 5.0f; break;
-            default: v = env->paddle_width / (2.0f * HALF_PADDLE_WIDTH); break;
+            default: v = env->score / 864.0f; break;
         }
-        gpu_breakout_store_obs(&obs[lane], v);
+        gpu_breakout_store_obs(&obs[i], v);
     }
+#ifdef OBS_PACKED_WORDS
+    // Bit b set = brick b destroyed (feature 10 + b); bits past num_bricks stay 0.
+    unsigned int* words = (unsigned int*)(obs + OBS_PACKED_SCALARS);
+    for (int w = lane; w < OBS_PACKED_WORDS; w += nlanes) {
+        words[w] = env->brick_mask[w];
+    }
+#else
     const unsigned int* mask = env->brick_mask;
-    int n = c->num_bricks;
-    for (int i = lane; i < n; i += nlanes) {
+    for (int i = lane; i < c->num_bricks; i += nlanes) {
         gpu_breakout_store_obs(&obs[10 + i], gpu_brick_alive(mask, i) ? 0.0f : 1.0f);
     }
+#endif
 }
 
 __device__ static inline bool gpu_breakout_calc_vline_collision(float xw, float yw, float hw,
@@ -619,10 +617,9 @@ static void gpu_breakout_host_fill_config(GpuBreakoutConfig* cfg, Dict* kwargs) 
     cfg->paddle_speed = dict_get(kwargs, "paddle_speed");
     cfg->continuous = dict_get(kwargs, "continuous");
     cfg->num_bricks = cfg->brick_rows * cfg->brick_cols;
-    if (cfg->num_bricks <= 0 || cfg->num_bricks > BREAKOUT_GPU_MAX_BRICKS ||
-            cfg->num_bricks > OBS_SIZE - 10) {
-        fprintf(stderr, "Breakout GPU env supports 1..%d bricks and OBS_SIZE-10 slots; got %d\n",
-            BREAKOUT_GPU_MAX_BRICKS, cfg->num_bricks);
+    if (cfg->num_bricks <= 0 || cfg->num_bricks > BREAKOUT_OBS_BRICKS) {
+        fprintf(stderr, "Breakout GPU env supports 1..%d bricks; got %d\n",
+            BREAKOUT_OBS_BRICKS, cfg->num_bricks);
         exit(1);
     }
     cfg->half_max_score = gpu_breakout_compute_half_max_score(cfg->brick_rows, cfg->brick_cols);

@@ -8,6 +8,7 @@
 #include <assert.h>
 #include <float.h>
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -17,7 +18,8 @@
 #define PROTEIN_COST_QUANTILE 0.97f
 #define PROTEIN_MIN_OBS_NO_FAIL 100
 #define PROTEIN_COST_GROWTH 1.01f
-#define PROTEIN_CLF_ITERS 100
+#define PROTEIN_CLF_ITERS 500
+#define PROTEIN_CLF_LR 0.05f
 #define PROTEIN_THRESHOLD_COST_CAP 1.2f
 #define PROTEIN_THRESHOLD_FALLBACK 0.9f
 #define NOISE_PRIOR_MU (-4.60517f)
@@ -39,6 +41,10 @@ typedef struct {
     SpaceType type;
     float min, max, scale;
     int is_integer;
+    // couple_exp != 0: the swept value is raw * (1 - raw[couple_idx])^-couple_exp,
+    // e.g. lr_eff = lr / (1 - momentum)^0.7, turning a diagonal good band axis-aligned.
+    int couple_idx;
+    float couple_exp;
 } Space;
 
 typedef struct {
@@ -82,6 +88,30 @@ static inline float space_unnormalize(const Space *s, float norm) {
         val = roundf(val);
     }
     return val;
+}
+
+// Whole-vector normalized <-> raw with couplings applied. Partners are never coupled.
+static void sweep_space_to_raw(const SweepSpace *sp, const float *norm, float *raw) {
+    for (int i = 0; i < sp->num; i++) {
+        raw[i] = space_unnormalize(&sp->spaces[i], norm[i]);
+    }
+    for (int i = 0; i < sp->num; i++) {
+        const Space *s = &sp->spaces[i];
+        if (s->couple_exp != 0.0f) {
+            raw[i] *= powf(1.0f - raw[s->couple_idx], s->couple_exp);
+        }
+    }
+}
+
+static void sweep_space_from_raw(const SweepSpace *sp, const float *raw, float *norm) {
+    for (int i = 0; i < sp->num; i++) {
+        const Space *s = &sp->spaces[i];
+        float v = raw[i];
+        if (s->couple_exp != 0.0f) {
+            v *= powf(1.0f - raw[s->couple_idx], -s->couple_exp);
+        }
+        norm[i] = space_normalize(s, v);
+    }
 }
 
 // Softplus + Matern32+linear kernel
@@ -271,13 +301,18 @@ static int run_potrf(GaussianProcess *gp, float *d_K, int n, cudaStream_t stream
 }
 
 static int gp_recompute(GaussianProcess *gp, cudaStream_t stream) {
-    int n = gp->n;
+    int n = gp->n, np = gp->kernel->n_params;
     float noise = softplus(gp->raw_noise);
-    matern32lin_build_K(gp, gp->d_X, gp->d_X, n, n, noise, gp->d_L, stream);
-    int info = run_potrf(gp, gp->d_L, n, stream);
-    if (info != 0) {
-        matern32lin_build_K(gp, gp->d_X, gp->d_X, n, n, noise + 1e-8f, gp->d_L, stream);
+    // Retry jitter scales with the largest possible K_ii (inputs in [-1, 1]^d):
+    // a fixed 1e-8 is below float32 resolution at K_ii ~ 1-20 (same K, same fail).
+    float diag = softplus(gp->kernel->raw_params[SF_IDX(np)])
+        * (gp->dim + softplus(gp->kernel->raw_params[OFF_IDX(np)]) + 1.0f);
+    float jitter = 0.0f;
+    int info = 1;
+    for (int attempt = 0; attempt < 4 && info != 0; attempt++) {
+        matern32lin_build_K(gp, gp->d_X, gp->d_X, n, n, noise + jitter, gp->d_L, stream);
         info = run_potrf(gp, gp->d_L, n, stream);
+        jitter = attempt == 0 ? 1e-6f * diag : 10.0f * jitter;
     }
     if (info != 0) {
         return -2;
@@ -305,7 +340,8 @@ static void gp_predict(GaussianProcess *gp, const float *d_Xte, float *d_means, 
     cublasSaxpy(gp->cublas, m, &gp->mean, gp->d_ones, 0, d_means, 1);
 }
 
-// Train kernel hyperparameters with Adam (score GP and cost GP).
+// Train kernel hyperparameters with Adam (score GP and cost GP). NAN: Cholesky
+// failed even with jitter, alpha is invalid and the GP must not be used.
 static float gp_train(GaussianProcess *gp, float *opt_m, float *opt_v,
         float *opt_vmax, int *opt_t, float lr, const float *X, const float *y,
         int n_data, int training_iter, cudaStream_t stream) {
@@ -315,7 +351,7 @@ static float gp_train(GaussianProcess *gp, float *opt_m, float *opt_v,
         cudaMemcpyHostToDevice, stream);
     gp->n = n_data;
     if (gp_recompute(gp, stream) != 0) {
-        return 0.0f;
+        return NAN;
     }
 
     int n_kp = gp->kernel->n_params;
@@ -428,7 +464,9 @@ static float gp_train(GaussianProcess *gp, float *opt_m, float *opt_v,
             }
         }
     }
-    gp_recompute(gp, stream);
+    if (gp_recompute(gp, stream) != 0) {
+        return NAN;
+    }
     return loss;
 }
 
@@ -493,12 +531,17 @@ typedef struct {
     float expansion_rate;
     float cost_random_suggestion;
     float early_stop_quantile;
+    // use_collapse: successes at/below collapse_score (raw metric; at/above when
+    // minimizing) still train the GP but are negatives for the success classifier.
+    int use_collapse;
+    float collapse_score;
     int success_cap;
     int failure_cap;
     int top_k;
     unsigned long long rng_seed;
     // Internal
     float *succ_params, *succ_scores, *succ_costs;
+    unsigned char *succ_collapsed;
     float *fail_params, *fail_scores, *fail_costs;
     int succ_n, fail_n, n_top, dim, cost_dim;
     int *top_idx;
@@ -558,6 +601,7 @@ ProteinSweep *protein_sweep_create(ProteinSweep init) {
     sw->fail_scores = sw->fail_params + sw->failure_cap * dim;
     sw->fail_costs = sw->fail_scores + sw->failure_cap;
     sw->top_idx = (int *)malloc(sw->top_k * sizeof(int));
+    sw->succ_collapsed = (unsigned char *)calloc(sw->success_cap, 1);
 
     int max_centers = sw->success_cap + 3 * sw->top_k;
     int acq_cap = max_centers * sw->suggestions_per_pareto;
@@ -580,7 +624,8 @@ ProteinSweep *protein_sweep_create(ProteinSweep init) {
     protein_k_init_rng<<<(acq_cap + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
         sw->d_rng, acq_cap, sw->rng_seed);
 
-    sw->clf_w = (float *)calloc(dim, sizeof(float));
+    // Quadratic logistic features [x, x^2]: a band (fail on both sides) is representable.
+    sw->clf_w = (float *)calloc(2 * dim, sizeof(float));
     gp_init(&sw->gp_score, dim, sw->gp_max_obs, acq_cap, 0.01f);
     gp_init(&sw->gp_cost, dim, sw->gp_max_obs, acq_cap, 0.01f);
     sw->n_opt = sw->gp_score.kernel->n_params + 2;
@@ -613,11 +658,37 @@ static float logit_transform(float value) {
     return fmaxf(-5.0f, logf(value / (1.0f - value)));
 }
 
+// Insert succ idx into top_idx (top_k best successes, score descending).
+static void protein_top_insert(ProteinSweep *sw, int idx) {
+    float score = sw->succ_scores[idx];
+    if (sw->n_top >= sw->top_k && score <= sw->succ_scores[sw->top_idx[sw->n_top - 1]]) {
+        return;
+    }
+    if (sw->n_top < sw->top_k) {
+        sw->top_idx[sw->n_top++] = idx;
+    } else {
+        sw->top_idx[sw->n_top - 1] = idx;
+    }
+    for (int j = sw->n_top - 1; j > 0; j--) {
+        if (sw->succ_scores[sw->top_idx[j]] <= sw->succ_scores[sw->top_idx[j - 1]]) {
+            break;
+        }
+        int tmp = sw->top_idx[j];
+        sw->top_idx[j] = sw->top_idx[j - 1];
+        sw->top_idx[j - 1] = tmp;
+    }
+}
+
+// Scores are stored as direction * score: everything downstream maximizes.
 void protein_sweep_observe(ProteinSweep *sw, const float *norm_params,
         float score, float cost, int is_failure) {
+    // Raw metric, before logit/direction. NaN compares false: handled as failure below.
+    unsigned char collapsed = sw->use_collapse
+        && sw->space->optimize_direction * (score - sw->collapse_score) <= 0.0f;
     if (sw->use_logit) {
         score = logit_transform(score);
     }
+    score *= sw->space->optimize_direction;
     int dim = sw->dim;
     if (is_failure || !isfinite(score)) {
         if (sw->fail_n >= sw->failure_cap) {
@@ -639,10 +710,17 @@ void protein_sweep_observe(ProteinSweep *sw, const float *norm_params,
             memcpy(&sw->succ_params[i * dim], norm_params, dim * sizeof(float));
             sw->succ_scores[i] = score;
             sw->succ_costs[i] = cost;
+            sw->succ_collapsed[i] = collapsed;
+            // The replaced score may have been a top member: rescan.
+            sw->n_top = 0;
+            for (int j = 0; j < sw->succ_n; j++) {
+                protein_top_insert(sw, j);
+            }
             return;
         }
     }
-    if (sw->cost_dim >= 0 && norm_params[sw->cost_dim] <= -1.0f) {
+    // Below the budget range (early curve points); the min budget itself is kept.
+    if (sw->cost_dim >= 0 && norm_params[sw->cost_dim] < -1.0f) {
         return;
     }
     if (sw->succ_n >= sw->success_cap) {
@@ -652,29 +730,25 @@ void protein_sweep_observe(ProteinSweep *sw, const float *norm_params,
     memcpy(&sw->succ_params[idx * dim], norm_params, dim * sizeof(float));
     sw->succ_scores[idx] = score;
     sw->succ_costs[idx] = cost;
-    if (sw->n_top >= sw->top_k
-            && score <= sw->succ_scores[sw->top_idx[sw->n_top - 1]]) {
-        return;
+    sw->succ_collapsed[idx] = collapsed;
+    protein_top_insert(sw, idx);
+}
+
+// Success-classifier logit on quadratic features [x, x^2].
+static float clf_logit(const ProteinSweep *sw, const float *x) {
+    int dim = sw->dim;
+    float z = sw->clf_bias;
+    for (int d = 0; d < dim; d++) {
+        z += x[d] * (sw->clf_w[d] + x[d] * sw->clf_w[dim + d]);
     }
-    if (sw->n_top < sw->top_k) {
-        sw->top_idx[sw->n_top++] = idx;
-    } else {
-        sw->top_idx[sw->n_top - 1] = idx;
-    }
-    for (int j = sw->n_top - 1; j > 0; j--) {
-        if (sw->succ_scores[sw->top_idx[j]] <= sw->succ_scores[sw->top_idx[j - 1]]) {
-            break;
-        }
-        int tmp = sw->top_idx[j];
-        sw->top_idx[j] = sw->top_idx[j - 1];
-        sw->top_idx[j - 1] = tmp;
-    }
+    return z;
 }
 
 int protein_sweep_should_stop(const ProteinSweep *sw, float score, float cost) {
     if (sw->use_logit) {
         score = logit_transform(score);
     }
+    score *= sw->space->optimize_direction;
     if (!sw->cm_fitted) {
         return 0;
     }
@@ -942,6 +1016,12 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
         memset(sw->opt_m, 0, 6 * sw->n_opt * sizeof(float));
         sw->opt_t_score = sw->opt_t_cost = 0;
     }
+    if (isnan(score_loss) || isnan(cost_loss)) {
+        fprintf(stderr, "protein: GP Cholesky failed; random suggestion\n");
+        sobol_fallback(sw, out, is_fixed_cost, fixed_cost_norm);
+        info.is_random = 1;
+        return info;
+    }
 
     // Pareto front + prune
     for (int i = 0; i < sw->succ_n; i++) {
@@ -1172,53 +1252,51 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
         return info;
     }
 
-    // Success classifier
+    // Success classifier: negatives are failures plus collapsed successes.
     sw->clf_fitted = 0;
-    if (sw->use_success_prob && sw->succ_n > 9 && sw->fail_n > 9) {
+    if (sw->use_success_prob) {
         int n_s = sw->succ_n, n_f = sw->fail_n, n_clf = n_s + n_f;
         float *X = sw->ext_buf;
         int *yy = sw->kept_buf;
         memcpy(X, sw->succ_params, n_s * dim * sizeof(float));
         memcpy(X + n_s * dim, sw->fail_params, n_f * dim * sizeof(float));
+        int n_pos = 0;
         for (int i = 0; i < n_s; i++) {
-            yy[i] = 1;
+            yy[i] = !sw->succ_collapsed[i];
+            n_pos += yy[i];
         }
         for (int i = 0; i < n_f; i++) {
             yy[n_s + i] = 0;
         }
-        int n_pos = 0;
-        for (int i = 0; i < n_clf; i++) {
-            n_pos += yy[i];
-        }
         int n_neg = n_clf - n_pos;
-        if (n_pos > 0 && n_neg > 0) {
+        if (n_pos >= 10 && n_neg >= 10) {
             float w_pos = n_clf / (2.0f * n_pos);
             float w_neg = n_clf / (2.0f * n_neg);
-            memset(sw->clf_w, 0, dim * sizeof(float));
+            // L2 of 1/n_clf on the mean loss (sklearn C=1): O(1) decay would cap
+            // |w| near the gradient size and keep P(success) within ~0.4-0.6.
+            float l2 = 1.0f / n_clf;
+            memset(sw->clf_w, 0, 2 * dim * sizeof(float));
             sw->clf_bias = 0.0f;
-            float grad[dim];
+            float grad[2 * dim];
             for (int iter = 0; iter < PROTEIN_CLF_ITERS; iter++) {
-                float lr = 0.1f / (1.0f + 0.01f * iter);
-                for (int d = 0; d < dim; d++) {
+                for (int d = 0; d < 2 * dim; d++) {
                     grad[d] = 0.0f;
                 }
                 float grad_b = 0.0f;
                 for (int i = 0; i < n_clf; i++) {
-                    float z = sw->clf_bias;
-                    for (int d = 0; d < dim; d++) {
-                        z += X[i * dim + d] * sw->clf_w[d];
-                    }
-                    float sig = 1.0f / (1.0f + expf(-z));
+                    const float *x = &X[i * dim];
+                    float sig = 1.0f / (1.0f + expf(-clf_logit(sw, x)));
                     float err = (yy[i] ? w_pos : w_neg) * (sig - yy[i]) / n_clf;
                     for (int d = 0; d < dim; d++) {
-                        grad[d] += err * X[i * dim + d];
+                        grad[d] += err * x[d];
+                        grad[dim + d] += err * x[d] * x[d];
                     }
                     grad_b += err;
                 }
-                for (int d = 0; d < dim; d++) {
-                    sw->clf_w[d] -= lr * (grad[d] + sw->clf_w[d]);
+                for (int d = 0; d < 2 * dim; d++) {
+                    sw->clf_w[d] -= PROTEIN_CLF_LR * (grad[d] + l2 * sw->clf_w[d]);
                 }
-                sw->clf_bias -= lr * grad_b;
+                sw->clf_bias -= PROTEIN_CLF_LR * grad_b;
             }
             sw->clf_fitted = 1;
         }
@@ -1235,21 +1313,18 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
 
     int best = 0;
     float best_s = -FLT_MAX;
-    int opt_dir = sw->space->optimize_direction;
     for (int i = 0; i < n_cands; i++) {
-        float s = opt_dir * sw->h_pred[i];
+        // Weights in [0, 1] only shrink a non-negative rating; on a negative one
+        // they would favor over-budget / off-target candidates.
+        float s = fmaxf(sw->h_pred[i], 0.0f);
         if (!is_fixed_cost) {
             float cn = sw->h_pred[n_cands + i];
             float c = expf(cn * (log_c_max - log_c_min) + log_c_min);
             s *= (c < sw->max_suggestion_cost ? 1.0f : 0.0f)
-                * (1.0f - fabsf(target_cost - cn));
+                * fmaxf(1.0f - fabsf(target_cost - cn), 0.0f);
         }
         if (sw->clf_fitted) {
-            float z = sw->clf_bias;
-            for (int d = 0; d < dim; d++) {
-                z += sw->h_cands[i * dim + d] * sw->clf_w[d];
-            }
-            s *= 1.0f / (1.0f + expf(-z));
+            s *= 1.0f / (1.0f + expf(-clf_logit(sw, &sw->h_cands[i * dim])));
         }
         if (s > best_s) {
             best_s = s;
@@ -1261,7 +1336,8 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
 
     info.score_loss = score_loss;
     info.cost_loss = cost_loss;
-    info.predicted_score = y_norm * (max_score - min_score) + min_score;
+    info.predicted_score = sw->space->optimize_direction
+        * (y_norm * (max_score - min_score) + min_score);
     info.predicted_cost = expf(c_norm * (log_c_max - log_c_min) + log_c_min);
     info.rating = best_s;
     info.n_pareto = n_use;

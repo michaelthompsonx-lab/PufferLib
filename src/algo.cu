@@ -1024,10 +1024,10 @@ __global__ void __launch_bounds__(MGF_WARPS * 32, 4) mingru_fused_bwd(MgfBwdLaye
     }
 }
 
-// out.p[l] = sum over blocks of layer l's dW partials (blockIdx.y = l), on the side
-// stream after the backward, overlapping the encoder backward. Block = 32 outputs:
-// warp w sums partials w, w + MGF_RED_WARPS, ... (128 B rows), then a fixed-order sum
-// over warps.
+// out.p[l] = sum over blocks of layer l's dW partials (blockIdx.y = l), on the
+// background stream after the backward, under the encoder backward. Block = 32
+// outputs: warp w sums partials w, w + MGF_RED_WARPS, ... (128 B rows), then a
+// fixed-order sum over warps.
 struct MgfWgrad {
     precision_t* p[MGF_MAX_LAYERS];
 };
@@ -1499,10 +1499,13 @@ void packed_encoder_reg_train(void* w, void* activations,
 #endif
 
 #if !defined(PRECISION_FLOAT)
-// Decoder backward with at most DEC_SMALL_OUT outputs (H % 8 == 0): dX straight from
-// the fp32 grads beats assemble + cuBLAS (K = od + 1) about 2x at every H. The
-// forward stays on cuBLAS: a direct kernel only ties it at H = 32 and loses above.
+// Decoders with at most DEC_SMALL_OUT outputs (H % 8 == 0). Backward: dX straight
+// from the fp32 grads beats assemble + cuBLAS (K = od + 1) about 2x at every H.
+// Forward up to H = DEC_SMALL_FWD_H: a direct kernel ties cuBLAS in isolation at
+// H = 32 but beats it next to the concurrent learner / rollout (6 vs 10 us per
+// breakout rollout step); cuBLAS wins clearly from H = 128 on.
 #define DEC_SMALL_OUT 16
+#define DEC_SMALL_FWD_H 64
 
 __device__ __forceinline__ void dec_ld8(const precision_t* p, float* o) {
     uint4 v = *(const uint4*)p;
@@ -1512,6 +1515,45 @@ __device__ __forceinline__ void dec_ld8(const precision_t* p, float* o) {
         float2 f = __bfloat1622float2(h[q]);
         o[2 * q] = f.x;
         o[2 * q + 1] = f.y;
+    }
+}
+
+// out (R, od1) = X (R, H) @ W^T: thread = row, one pass over its X row; W staged in
+// shared memory (warp-uniform broadcast reads).
+__global__ void decoder_fwd_small(precision_t* __restrict__ out,
+        const precision_t* __restrict__ X, const precision_t* __restrict__ W,
+        int R, int H, int od1) {
+    extern __shared__ __align__(16) precision_t dec_w[];
+    for (int i = threadIdx.x; i < od1 * H / 8; i += blockDim.x) {
+        ((uint4*)dec_w)[i] = ((const uint4*)W)[i];
+    }
+    __syncthreads();
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= R) {
+        return;
+    }
+    const precision_t* x = X + (long)r * H;
+    float acc[DEC_SMALL_OUT] = {};
+    for (int c = 0; c < H; c += 8) {
+        float xv[8];
+        dec_ld8(x + c, xv);
+        #pragma unroll
+        for (int j = 0; j < DEC_SMALL_OUT; j++) {
+            if (j < od1) {
+                float wv[8];
+                dec_ld8(dec_w + j * H + c, wv);
+                #pragma unroll
+                for (int q = 0; q < 8; q++) {
+                    acc[j] += xv[q] * wv[q];
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (int j = 0; j < DEC_SMALL_OUT; j++) {
+        if (j < od1) {
+            out[(long)r * od1 + j] = from_float(acc[j]);
+        }
     }
 }
 
@@ -1557,6 +1599,15 @@ Prec decoder_forward(void* w, void* activations, Prec input, cudaStream_t stream
     if (a->wgrad_scratch.data) {
         a->saved_input = input;
     }
+#if !defined(PRECISION_FLOAT)
+    int H = dw->hidden_dim, od1 = dw->output_dim + 1;
+    if (od1 <= DEC_SMALL_OUT && H % 8 == 0 && H <= DEC_SMALL_FWD_H) {
+        int R = (int)(numel(input.shape) / H);
+        decoder_fwd_small<<<grid_size(R), BLOCK_SIZE, od1 * H * sizeof(precision_t),
+            stream>>>(a->out.data, input.data, dw->weight.data, R, H, od1);
+        return a->out;
+    }
+#endif
     puf_mm(&input, &dw->weight, &a->out, stream);
     return a->out;
 }
@@ -1665,6 +1716,7 @@ struct MinGRUActivations {
     // (num_layers, fused_blocks, 3*T*T) and W^T (T, 3*T)[num_layers]
     // written by the forward for the backward's dX; combined buffers stay unallocated.
     bool fused;
+    bool fused_all_layers;  // one bwd launch for all layers (partials fit in L2)
     int fused_blocks;
     Float dw_partials;
     Prec* wt;
@@ -1726,9 +1778,23 @@ void mingru_reg_train(void* w, void* activations,
         && TT % MGF_U == 0 && B_TT % MGF_ROWS == 0 && m->num_layers <= MGF_MAX_LAYERS;
     if (a->fused) {
         a->fused_blocks = B_TT / MGF_ROWS;
-        a->grad_bufs[0] = {.shape = {B_TT, H}};
+        // One backward launch for all layers keeps each block's rows in shared memory
+        // between layers, but its dW partials are summed only afterwards: worth it while
+        // they all stay in L2 (3080 Ti, 4 layers at 16K rows: 12 MB of 6 MB, 8% slower
+        // end to end). Otherwise one launch per layer, each layer's partials summed on
+        // the side stream while still in L2, under the next layer's backward.
         a->dw_partials = {.shape = {m->num_layers, a->fused_blocks, 3 * H * H}};
+        int dev, l2_bytes;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&l2_bytes, cudaDevAttrL2CacheSize, dev);
+        a->fused_all_layers =
+            numel(a->dw_partials.shape) * (long)sizeof(float) <= l2_bytes / 2;
+        a->grad_bufs[0] = {.shape = {B_TT, H}};
+        a->grad_bufs[1] = {.shape = {B_TT, H}};
         alloc_register(acts, &a->grad_bufs[0]);
+        if (!a->fused_all_layers) {
+            alloc_register(acts, &a->grad_bufs[1]);
+        }
         alloc_register(acts, &a->dw_partials);
         a->wt = (Prec*)calloc(m->num_layers, sizeof(Prec));
         for (int i = 0; i < m->num_layers; i++) {
@@ -1892,7 +1958,7 @@ Prec mingru_backward(void* w, Prec grad, void* activations, cudaStream_t stream)
     MinGRUWeights* m = (MinGRUWeights*)w;
     MinGRUActivations* a = (MinGRUActivations*)activations;
 #if !defined(PRECISION_FLOAT)
-    if (a->fused) {
+    if (a->fused && a->fused_all_layers) {
         MgfBwdLayers p;
         MgfWgrad wgrad;
         for (int i = 0; i < m->num_layers; i++) {
@@ -1909,6 +1975,26 @@ Prec mingru_backward(void* w, Prec grad, void* activations, cudaStream_t stream)
             MGF_RED_WARPS * 32, 0, puf_fork(stream)>>>(wgrad, a->dw_partials.data,
             a->fused_blocks);
         return a->grad_bufs[0];
+    }
+    if (a->fused) {
+        long per_layer = (long)a->fused_blocks * 3 * MGF_H * MGF_H;
+        for (int i = m->num_layers - 1, k = 0; i >= 0; i--, k ^= 1) {
+            MgfBwdLayers p = {};
+            p.x[0] = a->scan_bufs[i].input_ptr;
+            p.W[0] = m->weights[i].data;
+            p.Wt[0] = a->wt[i].data;
+            p.hs[0] = a->scan_bufs[i].scan_h.data;
+            float* part = a->dw_partials.data + i * per_layer;
+            mingru_fused_bwd<<<a->fused_blocks, MGF_WARPS * 32, MGF_BWD_SMEM, stream>>>(
+                p, 1, a->grad_bufs[k].data, part, a->scan_bufs[i].terminals_ptr, grad.data,
+                m->horizon);
+            MgfWgrad wgrad = {};
+            wgrad.p[0] = a->wgrad_scratch[i].data;
+            mingru_fused_dw_reduce<<<3 * MGF_H * MGF_H / 32, MGF_RED_WARPS * 32, 0,
+                puf_fork(stream)>>>(wgrad, part, a->fused_blocks);
+            grad = a->grad_bufs[k];
+        }
+        return grad;
     }
 #endif
     for (int i = m->num_layers - 1, k = 0; i >= 0; i--, k ^= 1) {

@@ -2786,6 +2786,10 @@ void run_sweep(Ini* ini, const char* exe_path) {
         snprintf(params[n_params].key, sizeof(params[n_params].key), "%s", dot + 1);
 
         const char* dist = dict_get_str(dict, "distribution");
+        // An env ini drops a param its defaults sweep with distribution = none.
+        if (strcmp(dist, "none") == 0) {
+            continue;
+        }
         SpaceType type = SPACE_LINEAR;
         int is_integer = 0;
         if (strcmp(dist, "uniform") == 0) {

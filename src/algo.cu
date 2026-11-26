@@ -1119,6 +1119,8 @@ constexpr double ns_coeffs[5][3] = {
     {2.8366, -3.0525, 1.2012},
 };
 
+#include "capmuon.cuh"
+
 // Muon optimizer. Our benchmarks show this is a major
 // upgrade over Adam (weight decay not needed in RL).
 struct Muon {
@@ -1131,11 +1133,13 @@ struct Muon {
     Float mb;              // flat momentum buffer (param-sized)
     Prec gram, gram_buf, x_buf;
     Allocator* param_alloc;
+    CapManager cap_mgr;
 };
 
 void muon_init(Muon* m, Allocator* param_alloc, double momentum, Allocator* alloc) {
     m->momentum = momentum;
     m->param_alloc = param_alloc;
+    memset(&m->cap_mgr, 0, sizeof(m->cap_mgr));
     cudaMalloc((void**)&m->lr, sizeof(float));
     cudaMalloc((void**)&m->grad_norm, sizeof(float));
     cudaMalloc((void**)&m->ns_norm, sizeof(float));
@@ -1176,6 +1180,7 @@ void muon_step(Muon* m, Float weights, Prec grads,
     long offset = 0;
     for (int _i = 0; _i < m->param_alloc->num_regs; _i++) {
         AllocEntry& e = m->param_alloc->regs[_i];
+        long param_off = offset;
         precision_t* gc_ptr = grads.data + offset;
         long ne = numel(e.shape);
         offset += ne;
@@ -1191,13 +1196,23 @@ void muon_step(Muon* m, Float weights, Prec grads,
         Prec gram = {.data = m->gram.data, .shape = {M, M}};
         Prec gram_buf = {.data = m->gram_buf.data, .shape = {M, M}};
 
-        int nblk = min((int)grid_size(ne), 256);
-        muon_sum_sq_partials<<<nblk, 256, 0, stream>>>(
-            m->norm_partials, x.data, (int)ne);
-        muon_sum_sq_reduce<<<1, 256, 0, stream>>>(
-            m->ns_norm, m->norm_partials, nblk);
-        muon_l2_normalize<<<grid_size(ne), BLOCK_SIZE, 0, stream>>>(
-            x.data, m->ns_norm, 1e-7f, (int)ne);
+        CapLayer* cl = cap_mgr_find(&m->cap_mgr, param_off, (int)R, (int)C);
+        if (cl != NULL) {
+            cudaMemsetAsync(m->ns_norm, 0, sizeof(float), stream);
+            cap_r1_inner_proj_norm_kernel<<<(int)R, 128, 0, stream>>>(
+                x.data, (int)R, (int)C, cl->v1, cl->state, cl->zv, m->ns_norm);
+            cap_r1_inner_apply_norm_kernel<<<grid_size(ne), BLOCK_SIZE, 0, stream>>>(
+                x.data, (int)R, (int)C, cl->v1, cl->zv, cl->state,
+                m->ns_norm, 1e-7f);
+        } else {
+            int nblk = min((int)grid_size(ne), 256);
+            muon_sum_sq_partials<<<nblk, 256, 0, stream>>>(
+                m->norm_partials, x.data, (int)ne);
+            muon_sum_sq_reduce<<<1, 256, 0, stream>>>(
+                m->ns_norm, m->norm_partials, nblk);
+            muon_l2_normalize<<<grid_size(ne), BLOCK_SIZE, 0, stream>>>(
+                x.data, m->ns_norm, 1e-7f, (int)ne);
+        }
 
         // 5 steps land in x_buf. 4 = you break it.
         for (int i = 0; i < 5; ++i) {
@@ -1221,8 +1236,16 @@ void muon_step(Muon* m, Float weights, Prec grads,
             }
         }
         float scale = sqrtf(fmaxf(1.0f, (float)R / (float)C));
-        muon_store_update<<<grid_size(ne), BLOCK_SIZE, 0, stream>>>(
-            gc_ptr, x_buf.data, scale, (int)ne);
+        if (cl != NULL) {
+            cap_r1_outer_proj_kernel<<<(int)R, 128, 0, stream>>>(
+                x_buf.data, (int)R, (int)C, cl->v1, cl->state, cl->zv);
+            cap_r1_outer_store_kernel<<<grid_size(ne), BLOCK_SIZE, 0, stream>>>(
+                gc_ptr, x_buf.data, (int)R, (int)C, cl->v1, cl->zv,
+                cl->state, scale);
+        } else {
+            muon_store_update<<<grid_size(ne), BLOCK_SIZE, 0, stream>>>(
+                gc_ptr, x_buf.data, scale, (int)ne);
+        }
     }
     muon_weight_update<<<grid_size(n_grad), BLOCK_SIZE, 0, stream>>>(
         weights.data, grads.data, m->lr, 0.0f, n_grad);

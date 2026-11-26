@@ -303,6 +303,10 @@ typedef struct {
     float min_lr_ratio;
     bool anneal_lr;
     float momentum;
+    int muon_cap;
+    float muon_cap_p;
+    float muon_cap_c;
+    float muon_cap_ema;
     int minibatch_size;
     float replay_ratio;
     long total_timesteps;
@@ -1529,6 +1533,21 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
             graph.mb_terminals, dest_off, graph, p_logstd,
             pufferl->act_sizes, pufferl->ppo_bufs.grad_logits.data,
             pufferl->ppo_bufs.grad_values.data, stream);
+        if (mb == 0 && pufferl->muon.cap_mgr.num_layers > 0) {
+            EncoderActivations* enc_a = (EncoderActivations*)pufferl->train_activs.encoder;
+            MinGRUActivations* mg_a = (MinGRUActivations*)pufferl->train_activs.network;
+            DecoderActivations* dec_a = (DecoderActivations*)pufferl->train_activs.decoder;
+            for (int li = 0; li < pufferl->muon.cap_mgr.num_layers; li++) {
+                CapLayer* cl = &pufferl->muon.cap_mgr.layers[li];
+                if (cl->kind == 0) {
+                    cap_sketch_update(cl, enc_a->saved_input, stream);
+                } else if (cl->kind == 1) {
+                    cap_sketch_update(cl, mg_a->saved_inputs[cl->kind_idx], stream);
+                } else if (cl->kind == 2) {
+                    cap_sketch_update(cl, dec_a->saved_input, stream);
+                }
+            }
+        }
         puff_advantage<<<adv_grid, ADV_THREADS, 0, stream>>>(
             graph.mb_gae_v.data, graph.mb_rewards.data,
             graph.mb_terminals.data,
@@ -1788,6 +1807,10 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         .min_lr_ratio = puf_ini_get(ini, "train", "min_lr_ratio"),
         .anneal_lr = puf_ini_get(ini, "train", "anneal_lr") != 0,
         .momentum = puf_ini_get(ini, "train", "momentum"),
+        .muon_cap = (int)puf_ini_get(ini, "train", "muon_cap"),
+        .muon_cap_p = (float)puf_ini_get(ini, "train", "muon_cap_p"),
+        .muon_cap_c = (float)puf_ini_get(ini, "train", "muon_cap_c"),
+        .muon_cap_ema = (float)puf_ini_get(ini, "train", "muon_cap_ema"),
         .minibatch_size = puf_ini_get(ini, "train", "minibatch_size"),
         .replay_ratio = puf_ini_get(ini, "train", "replay_ratio"),
         .total_timesteps = puf_ini_get(ini, "train", "total_timesteps"),
@@ -2007,6 +2030,37 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
             .data = (precision_t*)pol->params_alloc.mem,
             .shape = {pol->params_alloc.total_elems},
         };
+    }
+    if (hypers.muon_cap > 0) {
+        CapManager* mgr = &pufferl->muon.cap_mgr;
+        mgr->num_layers = 0;
+        if (primary->arch.encoder.forward == encoder_forward
+                && mgr->num_layers < MAX_CAP_LAYERS) {
+            EncoderWeights* enc_w = (EncoderWeights*)primary->weights.encoder;
+            long enc_off = enc_w->weight.data - primary->param.data;
+            cap_layer_init(&mgr->layers[mgr->num_layers++], 0, 0,
+                enc_w->in_dim, enc_w->out_dim, enc_off,
+                hypers.muon_cap_ema, hypers.muon_cap_c, hypers.muon_cap_p);
+        }
+        if (hypers.muon_cap == 1) {
+            if (primary->arch.network.forward == mingru_forward) {
+                MinGRUWeights* mg_w = (MinGRUWeights*)primary->weights.network;
+                for (int li = 0; li < mg_w->num_layers && mgr->num_layers < MAX_CAP_LAYERS; li++) {
+                    long off = mg_w->weights[li].data - primary->param.data;
+                    cap_layer_init(&mgr->layers[mgr->num_layers++], 1, li,
+                        mg_w->hidden, 3 * mg_w->hidden, off,
+                        hypers.muon_cap_ema, hypers.muon_cap_c, hypers.muon_cap_p);
+                }
+            }
+            if (primary->arch.decoder.forward == decoder_forward
+                    && mgr->num_layers < MAX_CAP_LAYERS) {
+                DecoderWeights* dec_w = (DecoderWeights*)primary->weights.decoder;
+                long dec_off = dec_w->weight.data - primary->param.data;
+                cap_layer_init(&mgr->layers[mgr->num_layers++], 2, 0,
+                    dec_w->hidden_dim, dec_w->output_dim + 1, dec_off,
+                    hypers.muon_cap_ema, hypers.muon_cap_c, hypers.muon_cap_p);
+            }
+        }
     }
     if (hypers.async) {
         alloc_create(&pufferl->weight_alloc);

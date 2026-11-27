@@ -1198,12 +1198,7 @@ void muon_step(Muon* m, Float weights, Prec grads,
 
         CapLayer* cl = cap_mgr_find(&m->cap_mgr, param_off, (int)R, (int)C);
         if (cl != NULL) {
-            cudaMemsetAsync(m->ns_norm, 0, sizeof(float), stream);
-            cap_r1_inner_proj_norm_kernel<<<(int)R, 128, 0, stream>>>(
-                x.data, (int)R, (int)C, cl->v1, cl->state, cl->zv, m->ns_norm);
-            cap_r1_inner_apply_norm_kernel<<<grid_size(ne), BLOCK_SIZE, 0, stream>>>(
-                x.data, (int)R, (int)C, cl->v1, cl->zv, cl->state,
-                m->ns_norm, 1e-7f);
+            cap_r1_inner_apply(cl, x.data, (int)R, (int)C, m->ns_norm, 1e-7f, BLOCK_SIZE, stream);
         } else {
             int nblk = min((int)grid_size(ne), 256);
             muon_sum_sq_partials<<<nblk, 256, 0, stream>>>(

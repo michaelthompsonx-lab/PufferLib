@@ -31,7 +31,7 @@ struct CapLayer {
     long param_off;  // element offset of weight in flat param/grad buffer
     float ema_gamma; // EMA decay (default 0.9)
     float cap_c;     // threshold ratio c (default 1.0)
-    float cap_p;     // cap power p (default 0.5)
+    float cap_p;     // cap power p (default 0.25; 0.0 = exact zero-overhead Plain Muon, sweepable in [0, 0.6])
 
     // Device buffers (all O(d) or O(out_dim), zero atomicAdd)
     float* v1;       // [d] unit top eigenvector
@@ -51,7 +51,7 @@ inline void cap_layer_init(CapLayer* c, int kind, int kind_idx,
         int d, int out_dim, long param_off,
         float ema_gamma, float cap_c, float cap_p) {
     memset(c, 0, sizeof(*c));
-    if (d <= 0 || out_dim <= 0) {
+    if (d <= 0 || out_dim <= 0 || cap_p <= 0.0f) {
         return;
     }
     // Choose highest warp count whose disjoint SMEM (1 + 2*nwarps)*d*4 fits in 48KB:

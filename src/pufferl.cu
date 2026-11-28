@@ -2031,7 +2031,7 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
             .shape = {pol->params_alloc.total_elems},
         };
     }
-    if (hypers.muon_cap > 0) {
+    if (hypers.muon_cap > 0 && hypers.muon_cap_p > 0.0f) {
         CapManager* mgr = &pufferl->muon.cap_mgr;
         mgr->num_layers = 0;
         if (primary->arch.encoder.forward == encoder_forward
@@ -2637,6 +2637,10 @@ void run_sweep(Ini* ini, const char* exe_path) {
     for (int i = 0; i < ini->num_sections; i++) {
         Dict* dict = &ini->sections[i];
         if (strncmp(dict->name, "sweep.", 6) != 0) {
+            continue;
+        }
+        if (strcmp(dict->name, "sweep.train.muon_cap_p") == 0
+                && (int)puf_ini_get(ini, "train", "muon_cap") == 0) {
             continue;
         }
         const char* path = dict->name + 6;
